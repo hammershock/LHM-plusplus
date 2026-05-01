@@ -2,6 +2,106 @@
 
 本文档记录 LHM++ 在本地 Mac 与华为云 GPU 远程主机上的部署、同步和调试经验。新的环境问题、模型/数据同步路径和验证命令应持续追加到这里。
 
+## 推理流程概览
+
+### 输入
+
+| 类型 | 说明 |
+|------|------|
+| 参考图像 | **1~8 张**，shape `(N, 3, 512, 512)`，支持单张或多视角（模型名 "any-view" 即来源于此） |
+| Betas 形状参数 | `(1, 10)`，优先来自 Pose Estimator（`engine/pose_estimation/pose_estimator.py`）对参考图的预测；若跳过 Pose Estimator 也可直接使用 motion JSON 里预存的 betas |
+| Motion 驱动序列 | 来自 `motion_video/{name}/smplx_params/*.json` 预处理数据，每帧一个 JSON，包含完整 SMPL-X 参数和相机参数 |
+
+### Motion 序列结构（`prepare_motion_seqs_eval` 返回）
+
+```
+motion_seqs
+├── smplx_params               每帧身体参数，shape [1, F, *]
+│   ├── root_pose              全局旋转        [1, F, 3]
+│   ├── body_pose              身体关节        [1, F, 69]
+│   ├── jaw_pose               下颌            [1, F, 3]
+│   ├── leye_pose / reye_pose  眼睛            [1, F, 3]
+│   ├── lhand_pose/rhand_pose  双手            [1, F, 45]
+│   ├── trans                  全局平移        [1, F, 3]
+│   ├── expr                   表情系数        [1, F, 100]  ← 来自 FLAME 参数
+│   ├── focal / princpt        相机内参        [1, F, 2]
+│   ├── img_size_wh            图像尺寸        [1, F, 2]
+│   └── betas                  形状参数        [1, 10]      ← 所有帧共享
+├── render_c2ws                渲染相机外参     [1, F, 4, 4]
+├── render_intrs               渲染相机内参     [1, F, 4, 4]
+├── render_bg_colors           背景颜色        [1, F, 3]
+├── masks                      前景掩码列表     list[PIL]
+├── offset_list                裁剪偏移        list[(sx, sy, ox, oy)]
+└── ori_size                   原始渲染分辨率   (H, W)
+```
+
+### 推理流程图
+
+```mermaid
+flowchart TD
+    subgraph IN["输入"]
+        A["参考图像\n1~8 张 (any-view)\nref_img_tensors\n(1, N, 3, 512, 512)"]
+        B["Betas 形状参数\n(1, 10)\n来自 PoseEstimator\n或 motion JSON"]
+    end
+
+    subgraph MOT["Motion 驱动序列\nmotion_video/{name}/smplx_params/*.json"]
+        M1["SMPL-X 参数\nroot/body/jaw/eye/hand pose\ntrans · expr\n[1, F, *]"]
+        M2["相机参数\nrender_c2ws [1,F,4,4]\nrender_intrs [1,F,4,4]\nrender_bg_colors [1,F,3]"]
+    end
+
+    subgraph S1["① infer_single_view  —  特征提取（执行一次）"]
+        E["DINOv2 ViT-L/14\n(frozen encoder)\nimage_feats (1,N,P,D)"]
+        FLP["forward_latent_points\nQuery 点 + 点云 Transformer\n(SpConv + PointOps)"]
+        O1["gs_model_list\n初始 3D Gaussian 集合"]
+        O2["query_points\nSMPL-X 表面采样点"]
+        O3["transform_mat_neutral_pose\nT-pose 变换矩阵"]
+        O4["gs_hidden_features\nimage_latents\nmotion_emb · pos_emb"]
+    end
+
+    subgraph S2["② animation_infer  —  逐帧渲染（批处理，batch_size=40）"]
+        SK["SMPL-X 蒙皮\n+ Gaussian 变形\n(smplx_voxel_skinning)"]
+        GS["高斯泼溅渲染\n(gsplat / diff-gaussian-rasterization)"]
+        FR["batch_rgb   (T, H, W, 3)  float [0,1]\nbatch_mask  (T, H, W, 1)  float [0,1]"]
+    end
+
+    subgraph OUT["输出"]
+        K["RGB 帧序列\nnumpy uint8  (T, H, W, 3)\n实测: (30, 1024, 576, 3)"]
+        L["mp4 视频\nlibx264 · yuv420p"]
+    end
+
+    A --> E
+    B -->|"smplx_params['betas']"| FLP
+    E --> FLP
+    M1 -->|"第 0 帧 smplx_params\n(中性姿态参考)"| FLP
+    M2 -->|"第 0 帧相机参数"| FLP
+    FLP --> O1 & O2 & O3 & O4
+
+    O1 & O2 & O3 & O4 --> SK
+    M1 -->|"逐帧 pose/trans/expr\n[1, bs, *]"| SK
+    M2 -->|"逐帧相机参数\n[1, bs, 4, 4]"| GS
+    SK --> GS --> FR
+
+    FR -->|"clamp(0,1)×255\n→ uint8\nconcat 所有批次"| K
+    K --> L
+```
+
+### 各阶段输出汇总
+
+| 阶段 | 输出 | Shape / 类型 | 说明 |
+|------|------|-------------|------|
+| `infer_single_view` | `gs_model_list` | list | 初始 3D Gaussian 参数 |
+| `infer_single_view` | `query_points` | Tensor | SMPL-X 表面查询点 |
+| `infer_single_view` | `transform_mat_neutral_pose` | Tensor | T-pose → 当前 pose 变换 |
+| `infer_single_view` | `gs_hidden_features`, `image_latents`, `motion_emb`, `pos_emb` | Tensor | 跨帧复用的隐空间特征 |
+| `animation_infer` | `batch_rgb` | `(T,H,W,3)` float | 渲染 RGB，值域 [0,1] |
+| `animation_infer` | `batch_mask` | `(T,H,W,1)` float | 前景掩码，值域 [0,1] |
+| `inference_results` | RGB 帧序列 | `(T,H,W,3)` uint8 | 最终帧，值域 [0,255] |
+| 写盘 | mp4 视频 | 文件 | libx264，yuv420p |
+
+> **注**：`infer_unified.py` 的 `inference_video_mode` 还会在 `exps/reattached/` 下额外创建 `gt/` 和 `mask/` 目录，并可选保存拼接视图；`app.py` 只保存最终 mp4 和输入图快照（`raw.png`）。
+
+---
+
 ## 工作流约定
 
 - 本地 Mac：主代码仓库、文档维护、git 操作、模型/数据长期备份。
